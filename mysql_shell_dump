@@ -1,0 +1,304 @@
+#!/bin/bash
+# Script      : mysql_shell_dump
+# Description : Dump and import bulk MySQL databases table-wise.
+# Author      : 
+# Date        :
+#
+# USAGE:
+# $0 <action> { <options> <parameters> }
+# 
+# Actions:
+# -f|--flush    : Clear the destination directory of any obsolete remains
+# -d|--dump     : Dump all databases to the destination directory
+# -i|--import   : Import all databases from the destination directory
+#
+# Options:
+# -h            : Print this help
+# -H            : MySQL host to connect to
+# -p            : MySQL port to connect to
+# -U            : MySQL user to connect as
+# -P            : MySQL password to connect with
+#
+# Parameters:
+# y             : Assume YES to all questions
+# q             : Quiet run. Intended for use with cron (implies: -y)
+
+declare DST_DIR="/var/lib/dumps"
+
+declare MYSQL_HOST="localhost"
+declare MYSQL_PORT=""
+declare MYSQL_USER="root"
+declare MYSQL_PASS=""
+declare DOUBLE_OPT_IN=true
+declare QUIET=false
+
+declare LOCKFILE="/var/run/mysql_shell_dump.pid"
+declare LOGFILE="/var/log/mysql_shell_dump.log"
+declare MYSQL_BIN="$(echo mysql)"
+declare MYSQLDUMP_BIN="$(echo mysqldump)"
+declare AWK_BIN="$(which awk)"
+declare EGREP_BIN="$(which egrep)"
+declare ZIP_BIN="gzip"
+declare DBFILTER=""
+declare LOCK_TYPE="READ"
+
+declare TABLES=""
+
+load_configuration() {
+    config_locations="mysql_shell_dump.conf /etc/mysql_shell_dump.conf $HOME/.mysql_shell_dump.conf"
+    for config in $config_locations; do
+        [[ -r "$config" ]] && source "$config"
+    done
+}
+
+print_usage () {
+	head $0 -n 28
+	exit 0
+}
+
+action_log () {
+	timestamp="$(date +%d' '%b' '%Y' '-' '%H:%M:%S)"
+	$QUIET || echo "[$timestamp]" $@ | tee -a "$LOGFILE"
+	$QUIET && echo "[$timestamp]" $@ >> "$LOGFILE"
+}
+
+get_slave_status () {
+	slave_status=$($MYSQL_BIN $MYSQL_OPTIONS -Bse SLAVE STATUS \G | grep 'Slave.*Running' | awk '{ print $2}' | tr '[:upper:]' '[:lower:]')
+	if grep yes <(echo $slave_status) > /dev/null 2>&1; then
+		if ! grep no <(echo $slave_status) > /dev/null 2>&1; then
+			return 0
+		else
+			return 1
+		fi
+	fi
+	return 2
+}
+
+set_slave_start () {
+	$MYSQL_BIN $MYSQL_OPTIONS -Bse "START SLAVE;"
+}
+
+set_slave_stop () {
+	$MYSQL_BIN $MYSQL_OPTIONS -Bse "STOP SLAVE;"
+}
+
+get_databases () {
+    $MYSQL_BIN $MYSQL_OPTIONS -Bse 'SHOW DATABASES;' | $EGREP_BIN -v "$DBFILTER"
+}
+
+get_tables () {
+    db="$1"
+    $MYSQL_BIN $MYSQL_OPTIONS -Bse "USE \`$db\`; SHOW TABLES;"
+}
+
+lock_tables () {
+    declare db="$1"
+    declare lock=""
+	action_log "| | - Locking all tables in db: $db"
+    for tb in $TABLES; do
+        if [[ ! "$lock" == "" ]]; then
+            lock="$lock,"    
+        fi
+        lock="$lock \`$tb\` $LOCK_TYPE"
+    done
+    $MYSQL_BIN $MYSQL_OPTIONS -Bse "USE \`$db\`; LOCK TABLES $lock ;"
+}
+
+unlock_tables () {
+    declare db="$1"
+    # Unlock Tables
+	action_log "| | - Unlocking all tables in db: $db"
+    $MYSQL_BIN $MYSQL_OPTIONS -Bse "USE \`$db\`; UNLOCK TABLES;"
+}
+
+dump_sql () {
+	if $MYSQL_SLAVE_RUNNING; then
+		action_log "- Stopping slave replication"
+		set_slave_stop
+	fi
+	action_log "- Starting to dump all databases."
+    for db in $(get_databases); do
+		action_log "| - Starting to dump db: $db"
+        [[ ! -d "$DST_DIR/$db" ]] && mkdir -p "$DST_DIR/$db"
+		action_log "| | - Collecting tables from db: $db"
+        TABLES=$(get_tables "$db") # NOTE: GLOBAL var will be used in other functions, such as 'lock_tables' and 'unlock_tables'
+        if [ ${#TABLES} -ge 1 ]; then
+            lock_tables "$db"
+            for tb in $TABLES; do
+				action_log "| | | - Dumping $db.$tb"
+                if [[ $ZIP_BIN == 'gzip' ]]; then
+                    filename="$DST_DIR/$db/Table-$tb.sql.gz"
+                elif [[ $ZIP_BIN == 'bzip2' ]]; then
+                    filename="$DST_DIR/$db/Table-$tb.sql.bzip2"
+                else
+                    filename="$DST_DIR/$db/Table-$tb.sql"
+                fi
+                $MYSQLDUMP_BIN $MYSQLDUMP_OPTIONS "$db" "$tb" | $ZIP_BIN > "$filename"
+            done
+            unlock_tables "$db"
+        else
+            action_log "| | | - No Tables in $db"
+        fi
+		action_log "| - Done dumping db: $db"
+    done
+	action_log "| Done dumping all databases."
+	if $MYSQL_SLAVE_RUNNING; then
+		action_log "- Starting slave replication"
+		set_slave_start
+	fi
+}
+
+import_sql () {
+	for dir in $DST_DIR/*; do
+		if [[ ! -d $dir ]]; then continue; fi
+		db="$(basename $dir)"
+		action_log "| Current Database: $db"
+		action_log "| - Creating Database: $db"
+		$MYSQL_BIN $MYSQL_OPTIONS -Bse "CREATE DATABASE IF NOT EXISTS \`$db\`;"
+		action_log "| | - Starting to import tables for db: $db"
+		for tb in $dir/*; do
+			if [[ ! -f $tb ]]; then continue; fi
+			action_log "| | | - Importing: $tb"
+			$ZIP_BIN -dc $tb | $MYSQL_BIN $MYSQL_OPTIONS $db
+		done
+		action_log "| | - Done importing tables for db: $db"
+	done
+    action_log "| - Flushing privileges"
+    $MYSQL_BIN $MYSQL_OPTIONS -Bse "FLUSH PRIVILEGES;"
+}
+
+flush_dst_dir () {
+	action_log "| - Flushing the destination directory"
+	for dir in "$DST_DIR/"*; do
+		action_log "| - Deleting $dir"
+		rm -rf "$dir"
+	done
+	action_log "| - Done lushing the destination directory"
+}
+
+double_opt_in () {
+	action="$1"
+	cat <<EODD
+
+Dear admin,
+
+you are about performa an $action in a possible production environment with the following options:
+
+	Host: $MYSQL_HOST
+	Port: $MYSQL_PORT
+	User: $MYSQL_USER
+	Pass: $MYSQL_PASS
+	Destination directory: $DST_DIR
+
+The resulting MySQL command line will look like this:
+$MYSQL_BIN $MYSQL_OPTIONS
+
+EODD
+	read -n1 -p "Are you absolutley sure, you want to continue? [N|y] " answer
+	if [[ ! "$answer" == "y" ]]; then
+        echo "Aborting by user request."
+		exit 0
+	fi
+}
+
+assemble_mysql_options () {
+	MYSQL_OPTIONS="-h $MYSQL_HOST"
+	[[ -n $MYSQL_PORT ]] && MYSQL_OPTIONS="$MYSQL_OPTIONS --port $MYSQL_PORT"
+	[[ -n $MYSQL_USER ]] && MYSQL_OPTIONS="$MYSQL_OPTIONS -u$MYSQL_USER"
+	[[ -n $MYSQL_PASS ]] && MYSQL_OPTIONS="$MYSQL_OPTIONS -p$MYSQL_PASS"
+	MYSQLDUMP_OPTIONS="$MYSQL_OPTIONS --opt --single-transaction --hex-blob --default-character-set binary --events"
+
+	# test mysql connectivity
+	if ! $MYSQL_BIN $MYSQL_OPTIONS -Bse "Quit"; then
+		cat <<-EODD
+		ERROR: Cannot connect to MySQL."
+		Please check for running daemon or check your access data."
+	EODD
+		exit 1
+	fi
+
+}
+
+get_opts () {
+    while getopts "hH:p:U:P:yq" option; do
+        case $option in
+            h)print_usage;;
+            H)MYSQL_HOST="$OPTARG";;
+            p)MYSQL_PORT="$OPTARG";;
+            U)MYSQL_USER="$OPTARG";;
+            P)MYSQL_PASS="$OPTARG";;
+			y)DOUBLE_OPT_IN=false;;
+			q)DOUBLE_OPT_IN=false;QUIET=true;;
+            *)echo "Unknown parameter, aborting."; exit 1;;
+        esac
+    done
+
+	assemble_mysql_options
+
+	# figure out if $hostname is a working and running slave
+	# we need to know this in order to start and stop slave before and after dumping
+	get_slave_status
+	if [[ $? == 0 ]]; then
+		# is slave and slave is running
+		MYSQL_SLAVE_RUNNING=true
+		MYSQL_SLAVE_RUNNING_TXT='yes'
+	elif [[ $? == 1 ]]; then
+		# is slave and slave is broken
+		MYSQL_SLAVE_RUNNING=false
+		MYSQL_SLAVE_RUNNING_TXT='no'
+	else
+		# is not a slave
+		MYSQL_SLAVE_RUNNING=false
+		MYSQL_SLAVE_RUNNING_TXT='no'
+	fi
+}
+
+check_pid () {
+	if [[ -r "$LOCKFILE" ]]; then
+		action_log "- Found PID file."
+		pid=$(cat "$LOCKFILE")
+		if [[ "$(ps -p $pid -o comm=)" == "$(basename $0)" ]]; then
+			action_log "- Script allready running, aborting."
+			exit 1
+		else
+			action_log "- PID file is dead - script might have crashed during last run!"
+		fi
+	fi
+	echo $$ > "$LOCKFILE"
+}
+
+################
+#     MAIN     #
+################
+
+load_configuration
+check_pid
+
+# take action
+case $1 in
+    -d|--dump)
+        shift
+        get_opts $@
+		$DOUBLE_OPT_IN && double_opt_in "DUMP"
+        flush_dst_dir
+        dump_sql
+        ;;
+    -i|--import)
+        shift
+        get_opts $@
+		$DOUBLE_OPT_IN && double_opt_in "IMPORT"
+		import_sql
+        echo
+        ;;
+	-f|--flush)
+		shift
+		get_opts $@
+		flush_dst_dir
+		;;
+	*)
+		print_usage
+esac
+
+rm "$LOCKFILE"
+exit 0
+
